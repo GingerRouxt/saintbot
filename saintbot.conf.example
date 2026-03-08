@@ -1,0 +1,12 @@
+# SaintBot Configuration
+# Copy this to saintbot.conf and fill in your values.
+
+# Your Signal phone number (with country code, e.g. +15551234567)
+SIGNAL_ACCOUNT="+1XXXXXXXXXX"
+
+# Phone numbers allowed to send commands (array)
+# Only these numbers can control the bot — everyone else is ignored.
+ALLOWED_NUMBERS=("+1XXXXXXXXXX")
+
+# Poll interval in seconds (default: 5)
+POLL_INTERVAL=5
