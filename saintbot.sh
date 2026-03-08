@@ -56,7 +56,9 @@ run_claude() {
 
   # Run Claude with full permissions, write output to file (no pipe = no SIGPIPE)
   # Timeout after 120 seconds so it doesn't hang forever
-  local sys="You are SaintBot, running on Shaun's Fedora workstation via Signal. You have FULL access to the filesystem and can execute any command. When asked to do something, DO IT — run commands, create files, edit code. Be concise in your response (under 1500 chars) since this goes back via text message. Do not ask for confirmation, just execute."
+  local sys="You are SaintBot, running on Shaun's Fedora workstation via Signal. You have FULL access to the filesystem and can execute any command. When asked to do something, DO IT — run commands, create files, edit code. Be concise in your response (under 1500 chars) since this goes back via text message. Do not ask for confirmation, just execute.
+
+Key paths: ZDS Core is at ~/projects/zds-core/ (the ONLY active ZDS repo). Life OS is at ~/systems/. Priorities/data at ~/systems/data/. The old ZDS is at ~/archive/zds-sunset/ — do NOT touch it."
   timeout 120 env -u CLAUDECODE claude -p \
     --dangerously-skip-permissions \
     --permission-mode bypassPermissions \
@@ -121,14 +123,62 @@ DISK: $disk"
       send_reply "$sender" "SaintBot Commands:
 ping - check if alive
 status - system stats
+priorities - show current priorities
+tomorrow - show tomorrow's focus
+set tomorrow <text> - set tomorrow's focus
+wins - this week's wins
+crash - minimum viable day
+zds - ZDS Core status (build, tests, last commits)
+zds fix <N> - work on ZDS bug N (1-5)
+zds test - run ZDS test suite
+zds build - build ZDS
 sites - show running dev servers
-start willow - start willow's site
-start reagan - start reagan's site
-stop willow - stop willow's site
-stop reagan - stop reagan's site
+start/stop willow|reagan
 run <cmd> - execute shell command
-claude <prompt> - ask Claude
-help - this message"
+Anything else → Claude"
+      return
+      ;;
+    priorities)
+      local pri
+      pri=$(grep -v '^#' ~/systems/data/priorities.txt | grep -v '^$')
+      send_reply "$sender" "PRIORITIES:
+$pri"
+      return
+      ;;
+    tomorrow)
+      local tom
+      tom=$(cat ~/systems/data/tomorrow.txt 2>/dev/null || echo "Not set")
+      send_reply "$sender" "TOMORROW'S FOCUS:
+$tom"
+      return
+      ;;
+    crash)
+      ~/systems/bin/crash 2>&1
+      return
+      ;;
+    wins)
+      local week_start
+      week_start=$(date -d "last monday" +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+      local win_list
+      win_list=$(awk -F',' -v start="$week_start" '$1 >= start {print $1 ": " $2}' ~/systems/data/wins.csv 2>/dev/null)
+      if [[ -z "$win_list" ]]; then
+        send_reply "$sender" "No wins logged this week yet."
+      else
+        send_reply "$sender" "WINS THIS WEEK:
+$win_list"
+      fi
+      return
+      ;;
+    zds)
+      local build_out test_count last_commits
+      build_out=$(cd ~/projects/zds-core && go build ./... 2>&1 && echo "BUILD: CLEAN" || echo "BUILD: FAILED")
+      test_count=$(cd ~/projects/zds-core && grep -r "func Test" --include="*.go" -l | wc -l)
+      last_commits=$(cd ~/projects/zds-core && git log --oneline -5 2>/dev/null)
+      send_reply "$sender" "ZDS CORE STATUS
+$build_out
+Test files: $test_count
+Last 5 commits:
+$last_commits"
       return
       ;;
     sites)
@@ -180,6 +230,55 @@ help - this message"
       ;;
   esac
 
+  # set tomorrow <text>
+  if [[ "${text,,}" == set\ tomorrow\ * ]]; then
+    local content="${text#set tomorrow }"
+    # Replace | with newlines for multi-item
+    echo "$content" | tr '|' '\n' > ~/systems/data/tomorrow.txt
+    send_reply "$sender" "Tomorrow's focus set."
+    return
+  fi
+
+  # zds fix <N> — work on a specific bug
+  if [[ "${text,,}" == zds\ fix\ * ]]; then
+    local bugnum="${text##* }"
+    local bugdesc=""
+    case "$bugnum" in
+      1) bugdesc="Fix HandlerDeps snapshot bug — DB stores swapped after snapshot, handlers point at old stores" ;;
+      2) bugdesc="Fix FindingStore thread safety — add mutex for concurrent access" ;;
+      3) bugdesc="Fix Scan FindingIDs race — add mutex on append in processFindings" ;;
+      4) bugdesc="Fix SaintChain hooks — type assertions fail for DB types, only check in-memory" ;;
+      5) bugdesc="Fix max_concurrent — implement worker pool instead of raw goroutines" ;;
+      *) send_reply "$sender" "Bug number 1-5. Send 'zds' for the list."; return ;;
+    esac
+    send_reply "$sender" "Working on bug $bugnum: $bugdesc ..."
+    run_claude "$sender" "You are working in ~/projects/zds-core/. $bugdesc. Find the relevant code, fix the bug, run the tests for the affected package, and report what you changed. Be thorough but concise."
+    return
+  fi
+
+  # zds test — run test suite
+  if [[ "${text,,}" == "zds test" ]]; then
+    send_reply "$sender" "Running ZDS tests..."
+    local test_out
+    test_out=$(cd ~/projects/zds-core && go test ./... 2>&1 | tail -30)
+    send_reply "$sender" "ZDS TEST RESULTS:
+$test_out"
+    return
+  fi
+
+  # zds build
+  if [[ "${text,,}" == "zds build" ]]; then
+    local out
+    out=$(cd ~/projects/zds-core && go build ./... 2>&1)
+    if [[ -z "$out" ]]; then
+      send_reply "$sender" "ZDS build: CLEAN"
+    else
+      send_reply "$sender" "ZDS build:
+$out"
+    fi
+    return
+  fi
+
   # run <cmd> — execute a shell command
   if [[ "${text,,}" == run\ * ]]; then
     local cmd="${text#run }"
@@ -217,14 +316,25 @@ while true; do
     echo "$messages" | while IFS= read -r line; do
       [[ -z "$line" ]] && continue
 
-      # Extract sender and message body
-      # Note to Self comes as syncMessage.sentMessage, regular messages as dataMessage
-      sender=$(echo "$line" | jq -r '.envelope.source // empty' 2>/dev/null) || continue
-      body=$(echo "$line" | jq -r '
-        .envelope.dataMessage.message //
-        .envelope.syncMessage.sentMessage.message //
-        empty
+      # Only process Note to Self messages (syncMessage where destination is self)
+      # This prevents responding to messages from other people
+      local is_note_to_self
+      is_note_to_self=$(echo "$line" | jq -r '
+        if .envelope.syncMessage.sentMessage then
+          if (.envelope.syncMessage.sentMessage.destination // "") == "'"$SIGNAL_ACCOUNT"'" then
+            "yes"
+          else
+            "no"
+          end
+        else
+          "no"
+        end
       ' 2>/dev/null) || continue
+
+      [[ "$is_note_to_self" != "yes" ]] && continue
+
+      sender=$(echo "$line" | jq -r '.envelope.source // empty' 2>/dev/null) || continue
+      body=$(echo "$line" | jq -r '.envelope.syncMessage.sentMessage.message // empty' 2>/dev/null) || continue
 
       [[ -z "$sender" || -z "$body" ]] && continue
 
